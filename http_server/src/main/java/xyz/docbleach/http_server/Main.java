@@ -1,27 +1,140 @@
 package xyz.docbleach.http_server;
 
-import io.vertx.core.AbstractVerticle;
-import io.vertx.core.Future;
-import io.vertx.core.Handler;
-import io.vertx.core.http.HttpServer;
-import io.vertx.core.http.HttpServerResponse;
-import io.vertx.ext.web.FileUpload;
-import io.vertx.ext.web.Router;
-import io.vertx.ext.web.RoutingContext;
-import io.vertx.ext.web.handler.BodyHandler;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.JsonParseException;
+import com.fasterxml.jackson.databind.JsonMappingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.SerializationFeature;
 import xyz.docbleach.api.BleachSession;
 import xyz.docbleach.api.bleach.DefaultBleach;
 import xyz.docbleach.api.exception.BleachException;
+import lombok.Data;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import static spark.Spark.*;
 
 import java.io.*;
-import java.util.Set;
+import java.util.Base64;
 
-public class Main extends AbstractVerticle {
+public class Main {
+
     private static final Logger LOGGER = LoggerFactory.getLogger(Main.class);
-    private static final long BODY_LIMIT = 1024 * 1024 * 150; // Size limit: 150MB
 
+    private static final int HTTP_BAD_REQUEST = 400;
+    private static final int INTERNAL_SERVER_ERROR = 500;
+
+    interface Validable {
+        boolean isValid();
+    }
+
+    @Data
+    static class PostPayload {
+        private String File;
+        
+        public boolean isValid() {
+            return File != null && !File.isEmpty();
+        }
+    }
+
+    @Data
+    static class Sanitized {
+        private Boolean Status;
+        private String Error;
+        private String File;
+        private int OriginalFileSize;
+        private int Base64Size;
+    }
+
+    public static void main(String[] args) {
+
+        port(getPortNumber());
+        
+        int maxThreads = 20;
+        int minThreads = 10;
+        int timeOutMillis = 60000;
+        threadPool(maxThreads, minThreads, timeOutMillis);
+
+        post("/sanitize", (request, response) -> {
+            
+            try {
+                PostPayload payload = getPayload(request.body());
+                if (!payload.isValid()) {
+                    response.status(HTTP_BAD_REQUEST);
+                    return "";
+                }
+                Sanitized sanitized = sanitize(payload.getFile());
+                response.status(200);
+                response.type("application/json");
+                return dataToJson(sanitized);
+            } catch (JsonParseException | JsonMappingException ex) {
+                response.status(HTTP_BAD_REQUEST);
+                return "";
+            } catch (BleachException ex) {
+                LOGGER.warn(String.format("DocBleach exception: %s", ex.toString()));
+                response.status(INTERNAL_SERVER_ERROR);
+                return "";
+            } catch (Exception ex) {
+                LOGGER.warn(String.format("Unknown exception: %s", ex.toString()));
+                response.status(INTERNAL_SERVER_ERROR);
+                return "";
+            }
+        });
+
+        after((request, response) -> {
+            LOGGER.info(String.format(
+                "%s %s => %s %d",
+                request.requestMethod(),
+                request.uri(),
+                request.protocol(),
+                response.status()
+            ));
+        });
+    }
+
+    private static PostPayload getPayload(String body) throws IOException, 
+            JsonParseException, JsonMappingException {
+                
+        ObjectMapper mapper = new ObjectMapper();
+        mapper.configure(JsonParser.Feature.ALLOW_COMMENTS, true);
+        PostPayload payload = mapper.readValue(body, PostPayload.class);
+        return payload;
+    }
+    
+    private static Sanitized sanitize(String content) throws BleachException {
+        
+        BleachSession session = new BleachSession(new DefaultBleach());
+        byte[] decoded = Base64.getDecoder().decode(content);
+
+        InputStream in = new ByteArrayInputStream(decoded);
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        
+        Sanitized sanitized = new Sanitized();
+        session.sanitize(in, out);
+        String sanitizedContent = out.toString();
+
+        if (sanitizedContent.isEmpty()) {
+            throw new BleachException("Sanitized file is empty");
+        }
+        
+        String encoded = Base64.getEncoder().encodeToString(sanitizedContent.getBytes());
+        sanitized.setFile(encoded.toString());
+        sanitized.setOriginalFileSize(sanitizedContent.length());
+        sanitized.setBase64Size(encoded.length());
+        sanitized.setStatus(true);
+
+        if (session.threatCount() == 0) {
+            sanitized.setError("The file was already safe, so I've just copied it over");
+        } else {
+            sanitized.setError(String.format(
+                "Sanitized file has been saved, %d potential threat(s) removed.", 
+                session.threatCount()
+            ));
+        }
+        LOGGER.info(sanitized.getError());
+        
+        return sanitized;
+    }
+    
     private static int getPortNumber() {
         int port = 8080;
         String PORT = System.getenv("PORT");
@@ -35,100 +148,15 @@ public class Main extends AbstractVerticle {
         return port;
     }
 
-    public void start() {
-        HttpServer server = vertx.createHttpServer();
-        Router router = Router.router(vertx);
-        router.route().handler(BodyHandler.create().setBodyLimit(BODY_LIMIT));
-
-        router.post("/sanitize").handler(routingContext -> {
-            Set<FileUpload> uploads = routingContext.fileUploads();
-            if (uploads.isEmpty()) {
-                routingContext.fail(404);
-                return;
-            }
-
-            for (FileUpload upload : uploads) {
-                LOGGER.info("FileName: {}", upload.fileName());
-                if (!"file".equals(upload.name())) {
-                    removeFiles(new File(upload.uploadedFileName()));
-                    continue;
-                }
-                // @TODO: split into multiple methods
-
-                LOGGER.info("UploadedFileName: {}", upload.fileName());
-
-                vertx.executeBlocking((Handler<Future<File>>) future -> {
-                    try {
-                        future.complete(sanitize(upload.uploadedFileName()));
-                    } catch (IOException | BleachException e) {
-                        LOGGER.error("Error", e);
-                        future.fail(e);
-                    }
-                }, res -> {
-                    if (!res.succeeded()) {
-                        routingContext.fail(res.cause());
-                        return;
-                    }
-
-                    final File saneFile = res.result();
-                    sendFile(routingContext, upload.fileName(), saneFile);
-                    removeFiles(new File(upload.uploadedFileName()), saneFile);
-                });
-
-                return;
-            }
-            // No "file" was found, we abort.
-            routingContext.fail(404);
-        });
-
-        router.route().handler(routingContext -> {
-            HttpServerResponse response = routingContext.response();
-            response.putHeader("content-type", "text/plain");
-            response.end("Hello from the light DocBleach Server!");
-        });
-
-        server.requestHandler(router::accept).listen(getPortNumber());
-    }
-
-    private void sendFile(RoutingContext routingContext, String fileName, File saneFile) {
-        HttpServerResponse response = routingContext.response();
-        response.putHeader("Content-Description", "File Transfer");
-        response.putHeader("Content-Type", "application/octet-stream");
-        response.putHeader("Content-Disposition", "attachment; filename=" + fileName); // @TODO: don't trust this name?
-        response.putHeader("Content-Transfer-Encoding", "binary");
-        response.putHeader("Expires", "0");
-        response.putHeader("Pragma", "Public");
-        response.putHeader("Cache-Control", "must-revalidate, post-check=0, pre-check=0");
-        response.putHeader("Content-Length", "" + saneFile.length());
-
-        response.sendFile(saneFile.getAbsolutePath());
-
-    }
-
-    private void removeFiles(File... files) {
-        vertx.executeBlocking(future -> {
-            for (File f : files) {
-                if (!f.delete()) {
-                    LOGGER.warn("Could not delete file{} ", f.getAbsolutePath());
-                }
-            }
-        }, __ -> {
-        });
-    }
-
-    private File sanitize(String uploadedFileName) throws IOException, BleachException {
-        BleachSession session = new BleachSession(new DefaultBleach());
-
-        File file = new File(uploadedFileName);
-        file.deleteOnExit();
-
-        try (InputStream is = new BufferedInputStream(new FileInputStream(file))) {
-            File fstream = File.createTempFile("docbleach_", "");
-            fstream.deleteOnExit();
-            try (FileOutputStream os = new FileOutputStream(fstream)) {
-                session.sanitize(is, os);
-            }
-            return fstream;
+    private static String dataToJson(Object data) {
+        try {
+            ObjectMapper mapper = new ObjectMapper();
+            mapper.enable(SerializationFeature.INDENT_OUTPUT);
+            StringWriter sw = new StringWriter();
+            mapper.writeValue(sw, data);
+            return sw.toString();
+        } catch (IOException e){
+            throw new RuntimeException("IOException from a StringWriter?");
         }
     }
 }
