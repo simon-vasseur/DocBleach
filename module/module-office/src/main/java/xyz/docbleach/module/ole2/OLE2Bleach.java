@@ -15,6 +15,7 @@ import xyz.docbleach.api.threat.ThreatType;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.Iterator;
 import java.util.Set;
 import java.util.function.Predicate;
 
@@ -28,7 +29,7 @@ import java.util.function.Predicate;
 public class OLE2Bleach implements Bleach {
     private static final Logger LOGGER = LoggerFactory.getLogger(OLE2Bleach.class);
     private static final String MACRO_ENTRY = "Macros";
-    private static final String COMPOUND_OBJECT_ENTRY = "CompObj";
+    private static final String COMPOUND_OBJECT_ENTRY = "\u0001CompObj";
     private static final String OBJECT_POOL_ENTRY = "ObjectPool";
     private static final String VBA_ENTRY = "VBA";
     private static final String NORMAL_TEMPLATE = "Normal.dotm";
@@ -66,6 +67,8 @@ public class OLE2Bleach implements Bleach {
                     .and(removeObjects(session))
                     .and(removeTemplate(session));
 
+            LOGGER.debug("Root ClassID: {}", rootIn.getStorageClsid());
+
             rootIn.getEntries().forEachRemaining(entry -> {
                 if (!visitor.test(entry)) {
                     return;
@@ -82,9 +85,26 @@ public class OLE2Bleach implements Bleach {
         }
     }
 
-    private void copyNodesRecursively(Entry entry, DirectoryEntry destination) {
+    private void copyNodesRecursively(Entry entry, DirectoryEntry target) {
+        LOGGER.trace("copyNodesRecursively: {}, parent: {}", entry.getName(), entry.getParent());
         try {
-            EntryUtils.copyNodeRecursively(entry, destination);
+            if (!entry.isDirectoryEntry()) {
+                DocumentEntry dentry = (DocumentEntry) entry;
+                DocumentInputStream dstream = new DocumentInputStream(dentry);
+                target.createDocument(dentry.getName(), dstream);
+                dstream.close();
+                return;
+            }
+
+            DirectoryEntry dirEntry = (DirectoryEntry) entry;
+            DirectoryEntry newTarget = target.createDirectory(entry.getName());
+            newTarget.setStorageClsid(dirEntry.getStorageClsid());
+            Iterator entries = dirEntry.getEntries();
+
+            while (entries.hasNext()) {
+                entry = (Entry) entries.next();
+                copyNodesRecursively(entry, newTarget);
+            }
         } catch (IOException e) {
             LOGGER.error("An error occured while trying to recursively copy nodes", e);
         }
@@ -112,6 +132,7 @@ public class OLE2Bleach implements Bleach {
         try (DocumentInputStream dis = new DocumentInputStream(dsiEntry)) {
             PropertySet ps = new PropertySet(dis);
             SummaryInformation dsi = new SummaryInformation(ps);
+
             sanitizeSummaryInformation(session, dsi);
         } catch (NoPropertySetStreamException | UnexpectedPropertySetTypeException | MarkUnsupportedException | IOException e) {
             LOGGER.error("An error occured while trying to sanitize the document entry", e);
@@ -217,7 +238,7 @@ public class OLE2Bleach implements Bleach {
             StringBuilder infos = new StringBuilder();
             if (entry instanceof DirectoryEntry) {
                 Set<String> entryNames = ((DirectoryEntry) entry).getEntryNames();
-                LOGGER.trace("Macros' entries: {}", entryNames);
+                LOGGER.trace("Compound Objects' entries: {}", entryNames);
                 infos.append("Entries: ").append(entryNames);
             } else if (entry instanceof DocumentEntry) {
                 int size = ((DocumentEntry) entry).getSize();
