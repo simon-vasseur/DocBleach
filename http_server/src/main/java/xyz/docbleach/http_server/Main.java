@@ -110,15 +110,14 @@ public class Main {
         
         Sanitized sanitized = new Sanitized();
         session.sanitize(in, out);
-        String sanitizedContent = out.toString();
 
-        if (sanitizedContent.isEmpty()) {
+        if (out.size() == 0) {
             throw new BleachException("Sanitized file is empty");
         }
         
-        String encoded = Base64.getEncoder().encodeToString(sanitizedContent.getBytes());
+        String encoded = Base64.getEncoder().encodeToString(out.toByteArray());
         sanitized.setFile(encoded.toString());
-        sanitized.setOriginalFileSize(sanitizedContent.length());
+        sanitized.setOriginalFileSize(out.size());
         sanitized.setBase64Size(encoded.length());
         sanitized.setStatus(true);
 
